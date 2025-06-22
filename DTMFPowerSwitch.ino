@@ -7,78 +7,105 @@
  */
 
 #include <avr/pgmspace.h>
+#include <avr/sleep.h>
 #include <tinyDTMF.h>
+
+/* MUST REMEMBER TO SET THESE FOR BOARD VERSION */
+//#define DIGIWIRE_REV 2
+#include <Digiwire_Plus_Pins.h>
 
 #include "cwtable.h"
 
 
 // Pin assignments
-#define tonePin 0           // Define Audio out Pin
-#define PTT 4               // Define PTT Pin 
-#define dtmfPin A0          // Audio input pin for DTMF (A0 is PB5)
+#define tonePin P0           // Define Audio out Pin
+#define PTT P4               // Define PTT Pin 
+#define dtmfPin P5           // Audio input pin for DTMF
+
+// Relay info
+const uint8_t relayPin[] = {P2,P3};           // Pins controlling relays
+const uint8_t onState[] = {LOW,LOW};            // On state of each pin
+// How many relays are there?
+#define numRelays sizeof(relayPin)/sizeof(uint8_t)
 
 #define toneFreq 800        // Define Morse Tone Frequency in Hz
 #define cspeed 2
 #define mspeed 1
 
 // Maximum time to complete a command
-#define CMD_PERIOD 30000UL
+#define CMD_PERIOD 60000UL
 // How often (ms) to check for DTMF input
 #define DTMF_PERIOD 100UL
 // Time until relay turns off after activated by command
-#define RELAY_PERIOD 15000UL
-// Time between IDs
-#define ID_PERIOD 600000UL
+#define RELAY_PERIOD 300000UL
+// Time between ID checks - should always be longest period
+#define ID_PERIOD 30000UL
+
+#define ADC_INTERNAL1V1 13
 
 const char toMsg[] PROGMEM = "CTO";
-const char onMsg[] PROGMEM = "QRT";
-const char offMsg[] PROGMEM = "QRO";
+const char onMsg[] PROGMEM = "DOWN";
+const char offMsg[] PROGMEM = "UP";
+const char perMsg[] PROGMEM = "OFF";
 const char idMsg[] PROGMEM = "N4BRF/RC";
+const char vccMsg[] PROGMEM = "VCC ";
 
+// Relay housekeeping
+unsigned long nextRelay[numRelays]; // Milliseconds till each relay turns off
+uint8_t relayState[numRelays];      // Current state of each relay
+bool stayOn[numRelays];             // True if relay should not time out
+
+// DTMF housekeeping
+tinyDTMF DTMF(dtmfPin);       // Declare tone decoder
+char dtmfKey = 0;             // Last key received and not yet processed
+bool waitForSpace = false;    // True if waiting for space between DTMF tones
+unsigned long nextDTMF = 0;   // Milliseconds til next check for a key
+
+// ID housekeeping
 unsigned long nextID;             // Milliseconds to next ID
 bool idNeeded;                    // True if PTT has been keyed during ID interval
 
-unsigned long nextDTMF = 0;       // Milliseconds to next check for a key
+// Command processor housekeeping
 unsigned long nextCmdTimeout = 0; // Milliseconds till current commend buffer times out
 bool cmdActive = false;           // True if a command line is being processed
 
-// Relay info
-uint8_t relayPin[] = {2,1};           // Pins controlling relays
-uint8_t onState[] = {LOW,HIGH};            // On state of each pin
-uint8_t offState[] = {HIGH,LOW};           // Off state of each pin
-unsigned long nextRelay[] = {0,0};  // Milliseconds till each relay turns off
-uint8_t relayState[] = {1,0};     // Current state of each relay
-bool stayOn[] = {false,false};    // True if relay should not time out
-uint8_t numRelays = sizeof(relayPin)/sizeof(int); // How many relays are there?
+char cmdBuffer[10];               // Holds part of command currently being input
+char* cmdPtr;                     // Points to current character in buffer during command processing
+uint8_t cmdRelay;                 // ID number of selected relay
+uint8_t cmdFunction;              // Selected function
 
-tinyDTMF DTMF(dtmfPin);     // Declare tone decoder
-char dtmfKey = 0;           // Last key received and not yet processed
-bool waitForSpace = false;   // True if waiting for space between DTMF tones
-
-char cmdBuffer[10];
-char* cmdPtr;
-uint8_t cmdRelay;
-uint8_t cmdFunction;
+// States for input command processor
+// Command syntax:  *password*relay*function#
 enum CMD_STATE {
-  CMD_IDLE,
-  CMD_GET_PW,
-  CMD_GET_RELAY,
-  CMD_GET_FUNCTION,
-  CMD_GET_END
+  CMD_IDLE,                       // Nothing happening
+  CMD_GET_PW,                     // Collecting password digits
+  CMD_GET_RELAY,                  // Collecting relay number
+  CMD_GET_FUNCTION,               // Collecting function
+  CMD_GET_END                     // Got all parts, ready to process command
 } cmdState = CMD_IDLE;
 
+// Initialization
 void setup() {
-  pinMode(tonePin,OUTPUT);
-  pinMode(PTT,OUTPUT);
-  digitalWrite(tonePin,LOW);
+  pinMode(tonePin,OUTPUT);                  // Enable tone output pin
+  pinMode(PTT,OUTPUT);                      // Enable Push-to-talk pin
+  pinMode(LED_BUILTIN,OUTPUT);              // Enable onboard LED
+  digitalWrite(tonePin,LOW);                // Init tone and PTT pins to inactive
   digitalWrite(PTT,LOW);
-  for(int i=0; i<numRelays; i++) {
-    pinMode(relayPin[i],OUTPUT);
-    digitalWrite(relayPin[i],offState[i]);
+  digitalWrite(LED_BUILTIN,LOW);            // Turn off LED for now
+  for(uint16_t i=0; i<numRelays; i++) {          // For each relay
+    pinMode(relayPin[i],OUTPUT);            // Enable output pin
+    digitalWrite(relayPin[i],!onState[i]);  // Set relay to off state
+    relayState[i] = !onState[i];            // Remember off state
+    nextRelay[i] = 0L;                      // Init relay's timer count
+    stayOn[i] = false;                      // Init "stay on" (timer disable) flag
   }
   DTMF.begin();             // Initialize DTMF decoder
   cmdBuffer[0] = 0;         // Initialize command buffer
   cmdPtr = &cmdBuffer[0];   //   and its pointer
+  cmdState = CMD_IDLE;
+  cmdRelay = 0;
+  cmdFunction = 0;
+  
   nextID = millis();        // make sure we ID at startup
   idNeeded = true;
 }
@@ -108,15 +135,14 @@ bool checkDTMF(void) {
 
 // Key the radio
 void pttDown(void) {
-  delay(1000);               //Always wait 1 sec first so commands can unkey
   digitalWrite(PTT,HIGH);
-  delay(500);                //Wait for Radio to TX
+  delay(400);                //Wait for Radio to TX
   idNeeded = true;           //Remember that we transmitted
+  nextID = millis() + ID_PERIOD;  // set next time to ID
 }
 
 // Unkey the radio
 void pttUp(void) {
-    delay(500);               //Wait for last element before unkeying
     digitalWrite(PTT,LOW);
 }
 
@@ -141,19 +167,23 @@ void SendMorse(const char message[], const char prefix=0) {
 //DAH Function - send a DAH
 //void dah(int loops){
 void dah(void) {
-      tone(tonePin,toneFreq);
-      delay(385/cspeed);
-      noTone(tonePin);
-      delay(90/cspeed);
+  tone(tonePin,toneFreq);
+  digitalWrite(LED_BUILTIN,HIGH);
+  delay(385/cspeed);
+  noTone(tonePin);
+  digitalWrite(LED_BUILTIN,LOW);
+  delay(90/cspeed);
 }
 
 //DIT Function - send a DIT
 //void dit(int loops){
 void dit(void){
-      tone(tonePin,toneFreq);
-      delay(125/cspeed);
-      noTone(tonePin);
-      delay(100/cspeed);
+  tone(tonePin,toneFreq);
+  digitalWrite(LED_BUILTIN,HIGH);
+  delay(125/cspeed);
+  noTone(tonePin);
+  digitalWrite(LED_BUILTIN,LOW);
+  delay(100/cspeed);
 }
 
 //WordBreak Function - delay between words
@@ -219,34 +249,55 @@ void sendChar(const char c) {
 }
 
 void relayOff(int r=0) {
-  digitalWrite(relayPin[r],offState[r]);
+  digitalWrite(relayPin[r],!onState[r]);
   SendMorse(offMsg,(r+'1'));           // Acknowledge command
-  relayState[r] = offState[r];         // Remember relay state
+  relayState[r] = !onState[r];         // Remember relay state
 }
 
-void relayOn(int r=0) {
+void relayOn(int r=0, bool p=false) {
   digitalWrite(relayPin[r],onState[r]);
-  SendMorse(onMsg,(r+'1'));            // Acknowledge command
+  if(p) {
+    SendMorse(perMsg, (r+'1'));
+  } else {
+    SendMorse(onMsg,(r+'1'));            // Acknowledge command
+  }
   relayState[r] = onState[r];          // Remember relay state
+}
+
+uint16_t readVcc() {
+  analogReference(DEFAULT);
+  delay(100);
+  uint16_t y = analogRead(ADC_INTERNAL1V1); // Dummy read for stability
+  return(11830/analogRead(ADC_INTERNAL1V1));  // Return reading in 10ths of volts
+}
+
+void sendVcc() {
+  uint16_t vcc = readVcc();
+  SendMorse(vccMsg);
+  pttDown();
+  sendChar(vcc/10+'0');
+  sendChar(vcc%10+'0');
+  pttUp();
 }
 
 // Process the latest DTMF key received
 void processKey(void) {
   if(dtmfKey != 0) {
+    delay(500);      // Allow time for user to listen for response
     switch(dtmfKey) {
       // Relay off
-      case '0':
+      case '1':
         relayOff(0);
         break;
       // Relay on for preconfigured time
-      case '1':
-        relayOn(0);
+      case '2':
+        relayOn(0,false);
         stayOn[0] = false;                 // Relay should time out and turn off
         nextRelay[0] = millis()+RELAY_PERIOD;  // Set time to turn relay back off
         break;
       // Relay on until turned off by command
-      case '2':
-        relayOn(0);
+      case '3':
+        relayOn(0,true);
         stayOn[0] = true;                  // Relay should stay on
         break;
       case '4':
@@ -254,14 +305,17 @@ void processKey(void) {
         break;
       // Relay on for preconfigured time
       case '5':
-        relayOn(1);
+        relayOn(1,false);
         stayOn[1] = false;                 // Relay should time out and turn off
         nextRelay[1] = millis()+RELAY_PERIOD;  // Set time to turn relay back off
         break;
       // Relay on until turned off by command
       case '6':
-        relayOn(1);
+        relayOn(1,true);
         stayOn[1] = true;                  // Relay should stay on
+        break;
+      case 'B':
+        sendVcc();
         break;
       default:
         pttDown();                      // Otherwise send key followed by '?'
@@ -280,8 +334,8 @@ void loop() {
   if((long)(nextDTMF-timeNow) < 0) {          // is it time to look for a DTMF key?
     if(checkDTMF()) {                         // yes, see if there is one
       processKey();                           // got one, go process it
-      cmdActive = true;                       // TEMPORARY code to check timeout logic
-      nextCmdTimeout = timeNow+CMD_PERIOD;    //  DITTO
+//      cmdActive = true;                       // TEMPORARY code to check timeout logic
+//      nextCmdTimeout = timeNow+CMD_PERIOD;    //  DITTO
     }
     nextDTMF = timeNow+DTMF_PERIOD;           // set next target time to check for DTMF
   }
@@ -298,11 +352,13 @@ void loop() {
     }
     nextID = timeNow + ID_PERIOD;             // set next time to check
   }
-  for(int i=0; i<numRelays; i++) {
+  for(uint16_t i=0; i<numRelays; i++) {
     if((relayState[i] == onState[i]) && !stayOn[i]) {   // If the relay is currently on in timed mode
       if((long)(nextRelay[i]-timeNow) < 0) {       // and the relay active period has expired
         relayOff(i);
       }
     }
   }
+  set_sleep_mode(SLEEP_MODE_IDLE);            // Power down till the next timer interrupt
+  sleep_mode();
 }
